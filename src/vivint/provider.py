@@ -21,6 +21,10 @@ from scrypted_sdk import (
 
 from .camera import VivintCamera
 
+# vivintpy's PubNub subscription silently stops delivering events ~15-20
+# minutes after the last Vivint Sky API call. Keep it fed.
+KEEPALIVE_INTERVAL_SECONDS = 15 * 60
+
 
 class VivintProvider(ScryptedDeviceBase, DeviceProvider, Settings):
     """Vivint camera provider. Ported from scryptedapp/blink (BlinkProvider)."""
@@ -29,6 +33,7 @@ class VivintProvider(ScryptedDeviceBase, DeviceProvider, Settings):
     cameras: dict[str, VivintCamera] = {}
     session: ClientSession = None
     waiting_for_2fa: bool = False
+    __keepalive_task: asyncio.Task = None
 
     def __init__(self, nativeId: str = None) -> None:
         super().__init__(nativeId=nativeId)
@@ -156,6 +161,7 @@ class VivintProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             self.refresh_token = self.account.refresh_token
             self.waiting_for_2fa = False
             self.print("Authentication successful!")
+            self.__start_keepalive()
             await self.discover_cameras()
 
         except VivintSkyApiMfaRequiredError:
@@ -186,6 +192,7 @@ class VivintProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             self.refresh_token = self.account.refresh_token
             self.waiting_for_2fa = False
             self.print("2FA verification successful!")
+            self.__start_keepalive()
             await self.discover_cameras()
 
         except Exception as e:
@@ -238,8 +245,27 @@ class VivintProvider(ScryptedDeviceBase, DeviceProvider, Settings):
             self.print(f"Error discovering cameras: {e}")
             raise
 
+    def __start_keepalive(self) -> None:
+        if self.__keepalive_task:
+            self.__keepalive_task.cancel()
+        self.__keepalive_task = asyncio.create_task(self.__keepalive_loop())
+
+    async def __keepalive_loop(self) -> None:
+        """Ping the Vivint Sky API so the PubNub subscription keeps streaming."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+            if not self.account or not self.account.connected:
+                return
+            try:
+                await self.account.api.get_authuser_data()
+            except Exception as e:
+                self.print(f"Vivint keepalive failed: {e}")
+
     async def cleanup(self) -> None:
         """Clean up the account and session."""
+        if self.__keepalive_task:
+            self.__keepalive_task.cancel()
+            self.__keepalive_task = None
         if self.account and self.account.connected:
             try:
                 await self.account.disconnect()
